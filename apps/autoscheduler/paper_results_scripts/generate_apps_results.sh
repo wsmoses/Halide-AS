@@ -5,7 +5,7 @@ if [ $# -ne 1 ]; then
     exit
 fi
 
-HALIDE=$(dirname $0)/../../..
+HALIDE=$(dirname $0)/../../../build
 echo "Using Halide in " $HALIDE
 
 MODE=${1}
