@@ -2,7 +2,7 @@ HALIDE=$(dirname $0)/../../..
 
 echo "Using Halide in " $HALIDE
 
-export CXX="ccache c++"
+export CXX="ccache c++ -Wno-deprecated-declarations"
 
 export HL_MACHINE_PARAMS=32,24000000,160
 export HL_PERMIT_FAILED_UNROLL=1

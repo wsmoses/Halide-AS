@@ -2624,6 +2624,318 @@ struct State {
         }
 
     }
+   
+    enum class ActionEnum {
+        Inline,
+        Retile,
+        Option,
+        Parallelize
+    };
+    struct Action {
+    public:
+        ActionEnum ae;
+        unsigned var;
+        Action(ActionEnum ae_) : ae(ae_) {}
+        Action(ActionEnum ae_, unsigned var_) : ae(ae_), var(var_) {}
+    };
+
+    void generate_actions(const FunctionDAG &dag,
+                           const MachineParams &params,
+                           CostModel *cost_model,
+                           std::map<Action, IntrusivePtr<State>> actions ) const {
+        internal_assert(root.defined() && root->is_root());
+
+        if (num_decisions_made == 2*(int)dag.nodes.size()) {
+            return;
+        }
+
+        int next_node = num_decisions_made / 2;
+        int phase = num_decisions_made % 2;
+
+        if (!may_subtile()) {
+            // When emulating the older search space, we do all
+            // parallelizing last, so that it is independent of the
+            // tiling decisions.
+            next_node = num_decisions_made % dag.nodes.size();
+            phase = num_decisions_made / dag.nodes.size();
+        }
+
+        // Enumerate all legal ways to schedule the next Func
+        const FunctionDAG::Node *node = &dag.nodes[next_node];
+        for (const auto *e : node->outgoing_edges) {
+            internal_assert(root->computes(e->consumer->node))
+                << "Partially scheduled code doesn't compute " << e->consumer->name
+                << ", which is one of the consumers of " << node->func.name();
+        }
+
+        if (node->is_input) {
+            // We don't need to schedule nodes that represent inputs,
+            // and there are no other decisions to be made about them
+            // at this time.
+            // debug(0) << "Skipping over scheduling input node: " << node->func.name() << "\n";
+            auto child = make_child();
+            child->num_decisions_made++;
+            return;
+        }
+
+        if (!node->outgoing_edges.empty() && !root->calls(node)) {
+            debug(0) << "In state:\n";
+            dump();
+            debug(0) << node->func.name() << " is consumed by:\n";
+            for (const auto *e : node->outgoing_edges) {
+                debug(0) << e->consumer->name << "\n";
+                debug(0) << "Which in turn consumes:\n";
+                for (const auto *e2 : e->consumer->incoming_edges) {
+                    debug(0) << "  " << e2->producer->func.name() << "\n";
+                }
+            }
+            internal_error << "Pipeline so far doesn't use next Func: " << node->func.name() << '\n';
+        }
+
+        int num_children = 0;
+
+        if (phase == 0) {
+            // Injecting realizations
+            {
+                // 1) Inline it
+                if (node->stages.size() == 1 && !node->is_output) {
+                    auto child = make_child();
+                    LoopNest *new_root = new LoopNest;
+                    new_root->copy_from(*root);
+                    new_root->inline_func(node);
+                    child->root = new_root;
+                    child->num_decisions_made++;
+                    if (child->calculate_cost(dag, params, cost_model)) {
+                        num_children++;
+                        actions.emplace(Action(ActionEnum::Inline), std::move(child));
+                    }
+                }
+            }
+
+            // Some search-space pruning. If a node is pointwise, and
+            // so are all its inputs and so is its sole output, and
+            // inlining it is legal, just inline it. This saves time
+            // on long chains of pointwise things.
+            bool must_inline = (node->is_pointwise &&
+                                (num_children > 0) &&
+                                (node->outgoing_edges.size() == 1));
+            if (must_inline) {
+                for (const auto *e : node->stages[0].incoming_edges) {
+                    must_inline &= e->producer->is_pointwise;
+                }
+                for (const auto *e : node->outgoing_edges) {
+                    must_inline &= (e->consumer->node->is_pointwise ||
+                                    e->consumer->node->is_boundary_condition);
+                }
+                if (must_inline) {
+                    return;
+                }
+            }
+
+            // Construct a list of plausible dimensions to vectorize
+            // over. Currently all of them. TODO: Pre-prune the list
+            // of sane dimensions to vectorize a Func over to reduce
+            // branching factor.
+            vector<int> vector_dims;
+            if (!node->is_input && !node->is_output) {
+                for (int v = 0; v < node->dimensions; v++) {
+                    const auto &p = root->get_bounds(node)->region_computed(v);
+                    if (p.extent() >= node->vector_size) {
+                        vector_dims.push_back(v);
+                    }
+                }
+            }
+            // Outputs must be vectorized over their innermost
+            // dimension, because we don't have control of the
+            // storage. TODO: Go inspect to see which dimension has a
+            // stride==1 constraint instead of assuming 0.
+            if (vector_dims.empty()) {
+                vector_dims.push_back(0);
+            }
+
+            // 2) Realize it somewhere
+            for (int vector_dim : vector_dims) {
+                auto tile_options = root->compute_in_tiles(node, nullptr, params, vector_dim, false);
+                for (IntrusivePtr<const LoopNest> &n : tile_options) {
+                    auto child = make_child();
+                    child->root = std::move(n);
+                    child->num_decisions_made++;
+                    if (child->calculate_cost(dag, params, cost_model)) {
+                        num_children++;
+                        unsigned hash = vector_dim;
+                        n.structural_hash(hash, /*depth*/10);
+                        actions.emplace_back(Action(Retile, hash), std::move(child));
+                    }
+                }
+            }
+        } else {
+            // We are parallelizing the loops of the func we just injected a realization for.
+
+            bool should_parallelize = false;
+            const vector<int64_t> *pure_size = nullptr;
+            if (params.parallelism > 1) {
+                for (auto &c : root->children) {
+                    if (c->node == node && node->dimensions > 0) {
+                        if (c->stage->index == 0) {
+                            pure_size = &(c->size);
+                        }
+                        should_parallelize = true;
+                    }
+                }
+            }
+
+            if (!should_parallelize) {
+                // The Func must be scalar, or not compute_root, or
+                // we're not asking to use multiple cores.  Just
+                // return a copy of the parent state
+                num_children++;
+                auto child = make_child();
+                child->num_decisions_made++;
+                actions.emplace(Action(ActionEnum::Parallelize), std::move(child));
+            } else {
+                internal_assert(pure_size);
+
+                // Generate some candidate parallel task shapes.
+                auto tilings = generate_tilings(*pure_size, node->dimensions - 1, 2, true);
+
+                // We could also just parallelize the outer loop entirely
+                std::vector<int64_t> ones;
+                ones.resize(pure_size->size(), 1);
+                tilings.emplace_back(std::move(ones));
+
+                // Sort / filter the options
+                struct Option {
+                    vector<int64_t> tiling;
+                    double idle_core_wastage;
+                    bool entire;
+                    bool operator<(const Option &other) const {
+                        return idle_core_wastage < other.idle_core_wastage;
+                    }
+                    //WM: note that instead of hashing the overal set of options we shall move to simply using
+                    //  the defined actions that create the tiling. However, until the point that the action space
+                    //  is set, this should be fine for an initial integration test
+                    unsigned hash () const {
+                        unsigned h = 0;
+                        for(auto t : tiling) h ^= (t + 0x9e3779b9 + (h << 6) + (h >> 2));
+                        h ^= (entire + 0x9e3779b9 + (h << 6) + (h >> 2));
+                        //choosing to ignore idel_core_wastage h ^= (t + 0x9e3779b9 + (h << 6) + (h >> 2));
+                        return h;
+                    }
+                };
+                vector<Option> options;
+                for (size_t i = 0; i < tilings.size(); i++) {
+                    auto &t = tilings[i];
+                    Option o;
+                    o.entire = (i == tilings.size() - 1);
+
+                    for (size_t j = 0; j < pure_size->size(); j++) {
+                        t[j] = ((*pure_size)[j] + t[j] - 1) / t[j];
+                    }
+                    t.swap(o.tiling);
+
+                    // Compute max idle cores across the other stages of the Func
+                    int64_t min_total = 0, max_total = 0;
+                    o.idle_core_wastage = 1;
+                    for (const auto &c : root->children) {
+                        if (c->node == node) {
+                            int64_t total = 1;
+                            for (auto &l : c->stage->loop) {
+                                if (!l.rvar) {
+                                    total *= o.tiling[l.pure_dim];
+                                }
+                            }
+                            if (min_total != 0) {
+                                min_total = std::min(min_total, total);
+                            } else {
+                                min_total = total;
+                            }
+                            max_total = std::max(max_total, total);
+                            const double tasks_per_core = ((double)total) / params.parallelism;
+                            o.idle_core_wastage = std::max(o.idle_core_wastage,
+                                                           std::ceil(tasks_per_core) /
+                                                           tasks_per_core);
+                        }
+                    }
+
+                    // Filter out the less useful options
+                    bool ok =
+                        ((o.entire || min_total >= params.parallelism) &&
+                         (max_total <= params.parallelism * 16));
+
+                    if (!ok) continue;
+
+                    options.emplace_back(std::move(o));
+                }
+                std::sort(options.begin(), options.end());
+
+                // If none of the options were acceptable, don't
+                // parallelize. This tends to happen for things like
+                // compute_root color matrices.
+                if (options.empty()) {
+                    num_children++;
+                    auto child = make_child();
+                    child->num_decisions_made++;
+                    //WM: didn't create a new child here as didn't appear to be different from parent [thus consider illegal action, or could simply use identity action]
+                    //accept_child(std::move(child));
+                    return;
+                }
+
+                for (const auto &o : options) {
+                    if (num_children >= 1 && (o.idle_core_wastage > 1.2 || !may_subtile())) {
+                        // We have considered several options, and the
+                        // remaining ones leave lots of cores idle.
+                        break;
+                    }
+
+                    auto child = make_child();
+                    LoopNest *new_root = new LoopNest;
+                    new_root->copy_from(*root);
+                    for (auto &c : new_root->children) {
+                        if (c->node == node) {
+                            if (may_subtile()) {
+                                c = c->parallelize_in_tiles(params, o.tiling, new_root);
+                            } else {
+                                // We're emulating the old
+                                // autoscheduler for an ablation, so
+                                // emulate its parallelism strategy:
+                                // just keep parallelizing outer loops
+                                // until enough are parallel.
+                                vector<int64_t> tiling = c->size;
+                                int64_t total = 1;
+                                for (size_t i = c->size.size(); i > 0; i--) {
+                                    if (!c->stage->loop[i-1].pure || total >= params.parallelism) {
+                                        tiling[i-1] = 1;
+                                    }
+                                    while (tiling[i-1] > 1 &&
+                                           total * tiling[i-1] > params.parallelism * 8) {
+                                        tiling[i-1] /= 2;
+                                    }
+                                    total *= tiling[i-1];
+                                }
+                                c = c->parallelize_in_tiles(params, tiling, new_root);
+                            }
+                        }
+                    }
+                    child->root = new_root;
+                    child->num_decisions_made++;
+                    if (child->calculate_cost(dag, params, cost_model)) {
+                        num_children++;
+                        actions.emplace(Action(ActionEnum::Option, o.hash()), std::move(child));
+                    }
+                }
+            }
+        }
+
+
+        if (num_children == 0) {
+            debug(0) << "Warning: Found no legal way to schedule "
+                     << node->func.name() << " in the following State:\n";
+            dump();
+            // All our children died. Maybe other states have had
+            // children. Carry on.
+        }
+
+    }
 
     void dump() const {
         debug(0) << "State with cost " << cost << ":\n";

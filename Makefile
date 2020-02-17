@@ -45,6 +45,8 @@ define alwayslink
 endef
 endif
 
+C_FLAGS += -Wno-deprecated-declarations
+CXX_FLAGS += -Wno-deprecated-declarations
 SHELL = bash
 CXX ?= g++
 PREFIX ?= /usr/local
