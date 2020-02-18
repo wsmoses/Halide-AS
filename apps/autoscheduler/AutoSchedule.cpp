@@ -2642,7 +2642,7 @@ struct State {
     void generate_actions(const FunctionDAG &dag,
                            const MachineParams &params,
                            CostModel *cost_model,
-                           std::map<Action, IntrusivePtr<State>> actions ) const {
+                           std::map<Action, IntrusivePtr<State>> actions) const {
         internal_assert(root.defined() && root->is_root());
 
         if (num_decisions_made == 2*(int)dag.nodes.size()) {
@@ -3601,6 +3601,380 @@ void find_and_apply_schedule(FunctionDAG& dag,
         optimal->compute_featurization(dag, params, schedule_features);
     }
 }
+// The main entrypoint to generate a schedule with Deep RL for a pipeline.
+std::string generate_rl_schedule(const std::vector<Function> &outputs,
+                              const Target &target,
+                              const MachineParams &params) {
+    // Start a timer
+    HALIDE_TIC;
+
+    State::cost_calculations = 0;
+
+    // Get the seed for random dropout
+    string seed_str = get_env_variable("HL_SEED");
+    // Or use the time, if not set.
+    int seed = (int)time(NULL);
+    if (!seed_str.empty()) {
+        seed = atoi(seed_str.c_str());
+    }
+    debug(0) << "Dropout seed = " << seed << '\n';
+    std::mt19937 rng((uint32_t) seed);
+
+    // Get the beam size
+    string beam_size_str = get_env_variable("HL_BEAM_SIZE");
+    // Defaults to 32
+    size_t beam_size = 32;
+    if (!beam_size_str.empty()) {
+        beam_size = atoi(beam_size_str.c_str());
+    }
+    string weights_in_dir = get_env_variable("HL_WEIGHTS_DIR");
+    string weights_out_dir = get_env_variable("HL_WEIGHTS_OUT_DIR");
+    if (weights_out_dir.empty()) {
+        weights_out_dir = weights_in_dir;
+    }
+
+    string randomize_weights_str = get_env_variable("HL_RANDOMIZE_WEIGHTS");
+    bool randomize_weights = randomize_weights_str == "1";
+
+    // Support for distributed training of a model
+    string weights_server_hostname = get_env_variable("HL_WEIGHTS_SERVER_HOSTNAME");
+    string weights_server_port_str = get_env_variable("HL_WEIGHTS_SERVER_PORT");
+    int weights_server_port = 0;
+    if (!weights_server_port_str.empty()) {
+        weights_server_port = atoi(weights_server_port_str.c_str());
+    }
+    string weights_server_experiment_id_str = get_env_variable("HL_WEIGHTS_SERVER_EXPERIMENT_ID");
+    int weights_server_experiment_id = 0;
+    if (!weights_server_experiment_id_str.empty()) {
+        weights_server_experiment_id = atoi(weights_server_experiment_id_str.c_str());
+    }
+
+    // Analyse the Halide algorithm and construct our abstract representation of it
+    FunctionDAG dag(outputs, params, target);
+    dag.dump();
+
+    // Construct a cost model to use to evaluate states. Currently we
+    // just have the one, but it's an abstract interface, so others
+    // can be slotted in for experimentation.
+    std::unique_ptr<CostModel> cost_model;
+    cost_model = CostModel::make_default(weights_in_dir, weights_out_dir, randomize_weights,
+                                         weights_server_hostname, weights_server_port, weights_server_experiment_id);
+
+    IntrusivePtr<State> optimal;
+
+    // Run beam search
+    //optimal = optimal_schedule(dag, outputs, params, cost_model.get(), rng, beam_size);
+    // Run RL search
+    optimal = optimal_rl_schedule(dag, outputs, params, cost_model.get(),rng,beam_size);
+    HALIDE_TOC;
+
+    debug(0) << "Cost evaluated this many times: " << State::cost_calculations << '\n';
+
+    // Dump the schedule found
+    debug(0) << "** Optimal schedule:\n";
+
+    // Just to get the debugging prints to fire
+    optimal->calculate_cost(dag, params, cost_model.get(), true);
+
+    // Apply the schedules to the pipeline
+    optimal->apply_schedule(dag, params);
+
+    // Print out the schedule
+    optimal->dump();
+
+    string schedule_file = get_env_variable("HL_SCHEDULE_FILE");
+    if (!schedule_file.empty()) {
+        debug(0) << "Writing schedule to " << schedule_file << "...\n";
+        std::ofstream f(schedule_file);
+        f << "// --- BEGIN machine-generated schedule\n"
+          << optimal->schedule_source
+          << "// --- END machine-generated schedule\n";
+        f.close();
+        internal_assert(!f.fail()) << "Failed to write " << schedule_file;
+    }
+
+    // Save the featurization, so that we can use this schedule as
+    // training data (once we've benchmarked it).
+    string feature_file = get_env_variable("HL_FEATURE_FILE");
+    if (!feature_file.empty()) {
+        optimal->save_featurization(dag, params, feature_file);
+    }
+
+    // Return the schedule as a valid Halide source.
+    return optimal->schedule_source;
+}
+// Performance coarse-to-fine RL search and return the best state found.
+IntrusivePtr<State> optimal_rl_schedule(FunctionDAG &dag,
+                                     vector<Function> outputs,
+                                     const MachineParams &params,
+                                     CostModel *cost_model,
+                                     std::mt19937 &rng,
+                                     int beam_size) {
+
+    IntrusivePtr<State> best;
+
+    std::unordered_set<uint64_t> permitted_hashes;
+
+    // If the beam size is one, it's pointless doing multiple passes.
+    //int num_passes = (beam_size == 1) ? 1 : 5;
+
+    // not sure why would I need num_passes, but keeping it just in case
+    int num_passes = 1;
+    
+    string cyos_str = get_env_variable("HL_CYOS");
+    if (cyos_str == "1") {
+        // If the user is manually navigating the search space, don't
+        // ask them to do more than one pass.
+        num_passes = 1;
+    }
+
+    string num_passes_str = get_env_variable("HL_NUM_PASSES");
+    if (!num_passes_str.empty()) {
+        // The user has requested a non-standard number of passes.
+        num_passes = std::atoi(num_passes_str.c_str());
+    }
+
+    for (int i = 0; i < num_passes; i++) {
+        auto pass = optimal_rl_schedule_pass(dag, outputs, params, cost_model, rng, beam_size, i, num_passes, permitted_hashes);
+
+        debug(0) << "\nPass " << i << " result:\n";
+        pass->dump();
+
+        if (i == 0 || pass->cost < best->cost) {
+            // Track which pass produced the lowest-cost state. It's
+            // not necessarily the final one.
+            best = pass;
+        }
+    }
+
+    debug(0) << "Best cost: " << best->cost << "\n";
+
+    return best;
+}
+// A single pass of coarse-to-fine beam search.
+IntrusivePtr<State> optimal_rl_schedule_pass(FunctionDAG &dag,
+                                          vector<Function> outputs,
+                                          const MachineParams &params,
+                                          CostModel *cost_model,
+                                          std::mt19937 &rng,
+                                          int beam_size,
+                                          int pass_idx,
+                                          int num_passes,
+                                          std::unordered_set<uint64_t> &permitted_hashes) {
+
+    if (cost_model) {
+        configure_pipeline_features(dag, params, cost_model);
+    }
+
+    StateQueue q, pending;
+
+    // The initial state, with no decisions made
+    {
+        IntrusivePtr<State> initial{new State};
+        initial->root = new LoopNest;
+        q.emplace(std::move(initial));
+    }
+
+    // A progress bar.
+    uint32_t counter = 0;
+    bool draw_progress_bar = isatty(2);
+    auto tick = [&](double progress) {
+        if (!draw_progress_bar) return;
+        counter++;
+        const int bits = 11;
+        if (counter & ((1 << bits) - 1)) return;
+        progress *= 78;
+        debug(0) << '[';
+        for (int j = 0; j < 78; j++) {
+            if (j < progress) {
+                debug(0) << '.';
+            } else if (j - 1 < progress) {
+                debug(0) << "/-\\|"[(counter >> bits) % 4];
+            } else {
+                debug(0) << ' ';
+            }
+        }
+        debug(0) << ']';
+        for (int j = 0; j < 80; j++) {
+            debug(0) << '\b';
+        }
+    };
+
+    int expanded = 0;
+
+    std::function<void(IntrusivePtr<State> &&)> enqueue_new_children =
+        [&](IntrusivePtr<State> &&s) {
+
+        // debug(0) << "\n** Generated child: ";
+        // s->dump();
+        // s->calculate_cost(dag, params, nullptr, true);
+
+        // Each child should have one more decision made than its parent state.
+        internal_assert(s->num_decisions_made == s->parent->num_decisions_made + 1);
+
+        int progress = s->num_decisions_made * beam_size + expanded;
+        size_t max_progress = dag.nodes.size() * beam_size * 2;
+
+        // Update the progress bar
+        tick(double(progress) / max_progress);
+        s->penalized = false;
+
+        // Add the state to the list of states to evaluate
+        q.emplace(std::move(s));
+    };
+
+    string cyos_str = get_env_variable("HL_CYOS");
+
+    //////////////////////////////////////
+    
+    // This loop is beam search over the sequence of decisions to make.
+    for (int i = 0; ; i++) {
+        std::unordered_map<uint64_t, int> hashes;
+        q.swap(pending);
+        /*
+        if (pending.empty()) {
+            if (false && beam_size < 1000) {
+                // Total mortality. Double the beam size and
+                // restart. Disabled for now because total mortality
+                // may indicate a bug.
+                return optimal_rl_schedule_pass(dag,
+                                             outputs,
+                                             params,
+                                             cost_model,
+                                             rng,
+                                             beam_size * 2,
+                                             pass_idx,
+                                             num_passes,
+                                             permitted_hashes);
+            } else {
+                internal_error << "Ran out of legal states with beam size " << beam_size << "\n";
+            }
+        }
+        */
+        if ((int)pending.size() > beam_size * 10000) {
+            debug(0) << "Warning: Huge number of states generated (" << pending.size() << ").\n";
+        }
+
+        expanded = 0;
+        while (expanded < beam_size && !pending.empty()) {
+
+            IntrusivePtr<State> state {pending.pop()};
+            /*
+            if (beam_size > 1 && num_passes > 1) {
+                // We are doing coarse-to-fine beam search using the
+                // hashing strategy mentioned in the paper.
+                //
+                // We will lazily apply cost penalties to the queue
+                // according to structural uniqueness.
+                if (!state->penalized) {
+                    uint64_t h1 = state->structural_hash(pass_idx + 1);
+                    uint64_t h0 = state->structural_hash(pass_idx - 1);
+                    // We penalize the cost of a state proportionately
+                    // to how many states we've already seen with that
+                    // hash.
+                    int penalty = ++hashes[h1];
+                    if (pass_idx > 0 && !permitted_hashes.count(h0)) {
+                        // It's possible to get yourself into a state
+                        // where the only things in the beam that match
+                        // the hash were quick-rejected due to details not
+                        // captured in the hash, so we apply a huge
+                        // penalty, but leave the impermissible state in
+                        // the beam.
+                        penalty += 10;
+                    }
+                    if (penalty > 1) {
+                        state->penalized = true;
+                        state->cost *= penalty;
+                        // After penalizing this state, if it's no
+                        // longer the best, defer it. We set the
+                        // 'penalized' flag so that we know not to
+                        // penalize and defer it again.
+                        if (!pending.empty() && state->cost > pending.top()->cost) {
+                            pending.emplace(std::move(state));
+                            continue;
+                        }
+                    }
+                }
+            }
+            */
+            // Random dropout
+            if (pending.size() > 1 && random_dropout(rng, dag.nodes.size() * 2)) {
+                continue;
+            }
+
+            if (state->num_decisions_made == 2*(int)dag.nodes.size()) {
+                // We've reached the end of the pass. The first state
+                // must be the best, because we're pulling off a
+                // priority queue.
+                auto best = state;
+                /*
+                // Bless the reasonable stuff in the beam as
+                // permissible states to visit again. We define
+                // reasonable as having a cost no more than 20% higher
+                // than the cost of the best thing. Only do this if
+                // there are more coarse-to-fine passes yet to come.
+                if (pass_idx + 1 < num_passes) {
+                    int blessed = 0;
+                    while (state->cost <= 1.2 * best->cost && blessed < beam_size) {
+                        const State *s = state.get();
+                        while (s) {
+                            uint64_t h1 = s->structural_hash(pass_idx);
+                            permitted_hashes.insert(h1);
+                            s = s->parent.get();
+                        }
+                        if (pending.empty()) break;
+                        state = pending.pop();
+                        blessed++;
+                    }
+                }
+                */
+                return best;
+            }
+
+            state->generate_children(dag, params, cost_model, enqueue_new_children);
+            expanded++;
+        }
+        //////////////////////////////////////
+
+        // Drop the other states unconsidered.
+        pending.clear();
+
+        if (cost_model) {
+            // Now evaluate all the costs and re-sort them in the priority queue
+            cost_model->evaluate_costs();
+            q.resort();
+        }
+        /*
+        // AH: ignore from here
+        if (cyos_str == "1") {
+            // The user has set HL_CYOS, and wants to navigate the
+            // search space manually.  Discard everything in the queue
+            // except for the user-chosen option.
+            debug(0) << "\n--------------------\n";
+            debug(0) << "Select a schedule:\n";
+            for (int choice_label = (int)q.size() - 1; choice_label >= 0; choice_label--) {
+                auto state = q[choice_label];
+                debug(0) << "\n[" << choice_label << "]:\n";
+                state->dump();
+                state->calculate_cost(dag, params, cost_model, true);
+            }
+            cost_model->evaluate_costs();
+
+            // Select next partial schedule to expand.
+            int selection = -1;
+            while (selection < 0 || selection >= (int)q.size()) {
+                debug(0) << "\nEnter selection: ";
+                std::cin >> selection;
+            }
+
+            auto selected = q[selection];
+            selected->dump();
+            q.clear();
+            q.emplace(std::move(selected));
+        }*/
+    }
+}
+
 
 }
 
