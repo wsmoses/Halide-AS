@@ -2624,7 +2624,7 @@ struct State {
         }
 
     }
-   
+
     enum class ActionEnum {
         Inline,
         Retile,
@@ -2637,6 +2637,79 @@ struct State {
         unsigned var;
         Action(ActionEnum ae_) : ae(ae_) {}
         Action(ActionEnum ae_, unsigned var_) : ae(ae_), var(var_) {}
+        bool operator==(const Action& a) {
+            return ae == a.ae && var == a.var;
+        }
+    };
+
+    struct WrapperState {
+    public:
+        IntrusivePtr<State> inner;
+        unsigned numleft;
+
+        const FunctionDAG &dag;
+        const MachineParams &params;
+       CostModel *cost_model;
+
+    WrapperState(InstrusivePtr<State> inner, unsigned numleft, const FunctionDAG &dag, const MachineParams &params, CostModel* cost_model) : inner(inner). numleft(numleft), dag(dag), params(params),
+    cost_model(cost_model) {}
+
+    // copy and assignment operators should perform a DEEP clone of the given state
+    WrapperState(const WrapperState& other);
+    WrapperState& operator = (const WrapperState& other);
+
+    // whether or not this state is terminal (reached end)
+    bool is_terminal() const {
+        return numleft == 0;
+    }
+
+    //  agent id (zero-based) for agent who is about to make a decision
+    int agent_id() const {
+        return 0;
+    }
+
+    // apply action to state
+    void apply_action(const Action& action) {
+        std::map<Action, IntrusivePtr<State>> actions;
+        inner->generate_actions(dag, params, cost_model, actions);
+        for(auto &pair : actions) {
+            if (pair.first == action) {
+                inner = pair.second;
+            }
+        }
+        internal_assert(0);
+    }
+
+    // return possible actions from this state
+    void get_actions(std::vector<Action>& vactions) const {
+        std::map<Action, IntrusivePtr<State>> actions;
+        inner->generate_actions(dag, params, cost_model, actions);
+        for(auto &pair : actions) {
+            vactions.push_back(pair.first);
+        }
+    }
+
+    // get a random action, return false if no actions found
+    bool get_random_action(Action& action) const {
+        std::vector<Action> actions;
+        get_actions(actions);
+        if (actions.size() == 0) return false;
+        //note rand isn't truly uniform random so should fix
+        action = actions[rand() % actions.size()];
+        return true;
+    }
+
+    // evaluate this state and return a vector of rewards (for each agent)
+    const std::vector<float> evaluate() const {
+        inner->calculate_cost(dag, params, cost_model, false);
+        cost_model->evaluate_costs();
+        return { inner->cost(); }
+    }
+
+    // return state as string (for debug purposes)
+    std::string to_string() const {
+        return "";
+    }
     };
 
     void generate_actions(const FunctionDAG &dag,
@@ -3703,6 +3776,62 @@ std::string generate_rl_schedule(const std::vector<Function> &outputs,
     // Return the schedule as a valid Halide source.
     return optimal->schedule_source;
 }
+
+IntrusivePtr<State> optimal_mcts_schedule(FunctionDAG &dag,
+                                     vector<Function> outputs,
+                                     const MachineParams &params,
+                                     CostModel *cost_model,
+                                     std::mt19937 &rng,
+                                     int beam_size) {
+
+    IntrusivePtr<State> best;
+
+    std::unordered_set<uint64_t> permitted_hashes;
+
+    // If the beam size is one, it's pointless doing multiple passes.
+    //int num_passes = (beam_size == 1) ? 1 : 5;
+
+    // not sure why would I need num_passes, but keeping it just in case
+    int num_passes = 1;
+
+    string cyos_str = get_env_variable("HL_CYOS");
+    if (cyos_str == "1") {
+        // If the user is manually navigating the search space, don't
+        // ask them to do more than one pass.
+        num_passes = 1;
+    }
+
+    string num_passes_str = get_env_variable("HL_NUM_PASSES");
+    if (!num_passes_str.empty()) {
+        // The user has requested a non-standard number of passes.
+        num_passes = std::atoi(num_passes_str.c_str());
+    }
+
+    IntrusivePtr<State> initial{new State};
+    initial->root = new LoopNest;
+
+    WrapperState state(initial, num_passes, dag, params, cost_model);
+
+    Action action;          // contains an action that can be applied to a State, and bring it to a new State
+    UCT<WrapperState, Action> uct; // Templated class. Builds a partial decision tree and searches it with UCT MCTS
+
+    // OPTIONAL init uct params
+    uct.uct_k = sqrt(2);
+    uct.max_millis = 0;
+    uct.max_iterations = 100;
+    uct.simulation_depth = num_passes;
+
+    for (int i = 0; i < num_passes; i++) {
+        // run uct mcts on current state and get best action
+        action = uct.run(state);
+
+        // apply the action to the current state
+        state.apply_action(action);
+    }
+
+    return state.inner;
+}
+
 // Performance coarse-to-fine RL search and return the best state found.
 IntrusivePtr<State> optimal_rl_schedule(FunctionDAG &dag,
                                      vector<Function> outputs,
@@ -3720,7 +3849,7 @@ IntrusivePtr<State> optimal_rl_schedule(FunctionDAG &dag,
 
     // not sure why would I need num_passes, but keeping it just in case
     int num_passes = 1;
-    
+
     string cyos_str = get_env_variable("HL_CYOS");
     if (cyos_str == "1") {
         // If the user is manually navigating the search space, don't
@@ -3826,7 +3955,7 @@ IntrusivePtr<State> optimal_rl_schedule_pass(FunctionDAG &dag,
     string cyos_str = get_env_variable("HL_CYOS");
 
     //////////////////////////////////////
-    
+
     // This loop is beam search over the sequence of decisions to make.
     for (int i = 0; ; i++) {
         std::unordered_map<uint64_t, int> hashes;
