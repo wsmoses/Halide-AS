@@ -2634,11 +2634,12 @@ struct State {
     struct Action {
     public:
         ActionEnum ae;
-        unsigned var;
-        Action(ActionEnum ae_) : ae(ae_) {}
-        Action(ActionEnum ae_, unsigned var_) : ae(ae_), var(var_) {}
+        unsigned index;
+        unsigned option_var;
+        Action(ActionEnum ae_, unsigned index_) : ae(ae_), index(index_) {}
+        Action(ActionEnum ae_, unsigned index_, unsigned option_var_) : ae(ae_), index(index_), option_var(option_var_) {}
         bool operator==(const Action& a) {
-            return ae == a.ae && var == a.var;
+            return ae == a.ae && index == a.index && option_var == a.option_var;
         }
     };
 
@@ -2780,7 +2781,7 @@ struct State {
                     child->num_decisions_made++;
                     if (child->calculate_cost(dag, params, cost_model)) {
                         num_children++;
-                        actions.emplace(Action(ActionEnum::Inline), std::move(child));
+                        actions.emplace(Action(ActionEnum::Inline,num_children-1), std::move(child));
                     }
                 }
             }
@@ -2837,7 +2838,7 @@ struct State {
                         num_children++;
                         unsigned hash = vector_dim;
                         n.structural_hash(hash, /*depth*/10);
-                        actions.emplace_back(Action(Retile, hash), std::move(child));
+                        actions.emplace_back(Action(Retile,num_children-1, hash), std::move(child));
                     }
                 }
             }
@@ -2864,7 +2865,7 @@ struct State {
                 num_children++;
                 auto child = make_child();
                 child->num_decisions_made++;
-                actions.emplace(Action(ActionEnum::Parallelize), std::move(child));
+                actions.emplace(Action(ActionEnum::Parallelize,num_children-1), std::move(child));
             } else {
                 internal_assert(pure_size);
 
@@ -2993,7 +2994,7 @@ struct State {
                     child->num_decisions_made++;
                     if (child->calculate_cost(dag, params, cost_model)) {
                         num_children++;
-                        actions.emplace(Action(ActionEnum::Option, o.hash()), std::move(child));
+                        actions.emplace(Action(ActionEnum::Option,num_children-1, o.hash()), std::move(child));
                     }
                 }
             }
